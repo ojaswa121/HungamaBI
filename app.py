@@ -1,16 +1,18 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import json
 import requests
-import spacy
-from dotenv import load_dotenv
 import os
-from datetime import datetime
-import hashlib
 import re
+import hashlib
+from datetime import datetime
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
 from langdetect import detect, DetectorFactory
-DetectorFactory.seed = 0  # For deterministic langdetect
+import spacy
+
+# Set deterministic language detection
+DetectorFactory.seed = 0
 
 # Language mapping for readable names
 LANG_CODE_TO_NAME = {
@@ -19,9 +21,10 @@ LANG_CODE_TO_NAME = {
     'ne': 'Nepali', 'or': 'Odia', 'as': 'Assamese', 'kok': 'Konkani', 'sd': 'Sindhi', 'other': 'Other',
 }
 
-# Load environment variables
+# === Configuration ===
 load_dotenv()
 API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+POSTGRES_URI = 'postgresql://hungama:Hungama%402025%24%24@10.0.0.228:5432/youtube_scraper'
 
 # Load NLP model
 try:
@@ -98,44 +101,50 @@ def extract_insights_from_response(response):
         insights.append({'category': 'temporal', 'text': 'Temporal analysis conducted', 'confidence': 0.6})
     return insights
 
-@st.cache_data
-def load_youtube_metadata():
-    try:
-        with open("youtube_metadata.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        if isinstance(data, list):
-            df = pd.DataFrame(data)
-        elif isinstance(data, dict) and "videos" in data:
-            df = pd.DataFrame(data["videos"])
-        else:
-            df = pd.DataFrame(data)
-            
-        if df.empty:
-            st.warning("No video data found in the JSON file.")
-            return df
+# === Database & Queries ===
+@st.cache_resource
+def get_engine():
+    return create_engine(POSTGRES_URI)
 
-        # --- Robust published_at extraction ---
-        def extract_published_at(row):
-            val = row.get("published_at")
-            if isinstance(val, dict) and "$date" in val:
-                return val["$date"]
-            return val
-        df["published_at"] = df.apply(extract_published_at, axis=1)
+@st.cache_data(ttl=300)
+def get_table_names():
+    try:
+        engine = get_engine()
+        df = pd.read_sql("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", engine)
+        return df['table_name'].tolist()
+    except Exception as e:
+        st.error(f"Database connection error: {str(e)}")
+        return []
+
+@st.cache_data(ttl=300)
+def load_data(table):
+    try:
+        engine = get_engine()
+        df = pd.read_sql(f"SELECT * FROM {table}", engine)
+        
+        # Process data similar to first version
         df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce")
+        df["view_count"] = pd.to_numeric(df["view_count"], errors="coerce").fillna(0)
+        df["like_count"] = pd.to_numeric(df["like_count"], errors="coerce").fillna(0)
+        df["comment_count"] = pd.to_numeric(df["comment_count"], errors="coerce").fillna(0)
+        df["title"] = df["title"].fillna("")
+        df["description"] = df["description"].fillna("")
+        
+        # Add derived columns
         df["Year"] = df["published_at"].dt.year
         df["Month"] = df["published_at"].dt.strftime('%B')
         df["Date"] = df["published_at"].dt.date
         df["Time"] = df["published_at"].dt.strftime('%H:%M:%S')
         df["Day Name"] = df["published_at"].dt.day_name()
-
+        
+        # Add record label detection
         known_labels = [
             "T-Series", "Sony Music", "Zee Music", "Tips", "Saregama", "Aditya Music",
             "Lahari", "Speed Records", "YRF", "Venus", "SVF", "White Hill", "TIPS Official"
         ]
         
         def detect_label(row):
-            if "channel_name" in row and row["channel_name"]:
+            if "channel_name" in row and pd.notna(row["channel_name"]):
                 return row["channel_name"]
             text = f"{row.get('title', '')} {row.get('description', '')}".lower()
             for label in known_labels:
@@ -144,7 +153,8 @@ def load_youtube_metadata():
             return "Other"
             
         df["Record Label"] = df.apply(detect_label, axis=1)
-
+        
+        # Add artist extraction
         def extract_artists(row):
             text = f"{row.get('title', '')} {row.get('description', '')}"
             hashtags = re.findall(r"#(\w+)", text)
@@ -164,7 +174,8 @@ def load_youtube_metadata():
             return ", ".join(sorted(all_artists)) if all_artists else ""
             
         df["Artists"] = df.apply(extract_artists, axis=1)
-
+        
+        # Add language detection
         def guess_language(row):
             text = f"{row.get('title', '')} {row.get('description', '')}".lower()
             hashtags = re.findall(r"#(\w+)", text)
@@ -181,11 +192,11 @@ def load_youtube_metadata():
                 return 'Other'
                 
         df["Language"] = df.apply(guess_language, axis=1)
-
-        return df
+        
+        return df[df["view_count"] > 0]
         
     except Exception as e:
-        st.error(f"Error loading YouTube metadata: {str(e)}")
+        st.error(f"Error loading data from {table}: {str(e)}")
         return pd.DataFrame()
 
 def detect_months_and_confidence(text):
@@ -303,7 +314,7 @@ Maintain a structured memory of ongoing conversations. For each user session:
 5. Flag data gaps or anomalies where relevant.
 6. Maintain continuity and context memory throughout.
 7. Format your answer clearly using Markdown (e.g., bullet points, tables).
-8. Do **not** hallucinate. If you don’t have data, say so.
+8. Do **not** hallucinate. If you don't have data, say so.
 9. Be formal and concise unless the CXO shifts the tone.
 """
 
@@ -357,273 +368,279 @@ with st.sidebar:
                 if entry['charts_generated']:
                     st.write(f"**Charts:** {', '.join(entry['charts_generated'])}")
 
+    st.subheader("📦 Data Source")
+    tables = get_table_names()
+    if tables:
+        selected_table = st.selectbox("Select Table", tables)
+    else:
+        st.error("No database tables found")
+        st.stop()
+
 # === Main App ===
 st.header("📊 YouTube Analytics Dashboard")
 
-# Load YouTube data
+# Load YouTube data from PostgreSQL
 if st.session_state.youtube_data is None:
-    st.session_state.youtube_data = load_youtube_metadata()
+    with st.spinner("Loading data from PostgreSQL..."):
+        st.session_state.youtube_data = load_data(selected_table)
+
+df = st.session_state.youtube_data
+
+if df.empty:
+    st.error("No data loaded from database")
+    st.stop()
+
+st.success(f"✅ Loaded {len(df)} records from `{selected_table}`")
 
 # File upload and data processing
 uploaded_file = st.file_uploader("📁 Upload Revenue CSV", type=["csv"])
+actual_total = 0
 
 if uploaded_file is not None:
     try:
-        df = pd.read_csv(uploaded_file)
+        revenue_df = pd.read_csv(uploaded_file)
+        if "Store Name" in revenue_df.columns:
+            yt_row = revenue_df[revenue_df["Store Name"].str.lower().str.contains("youtube", na=False)]
+            actual_total = yt_row["Annual Revenue in INR"].values[0] if not yt_row.empty else 0
     except Exception as e:
         st.error(f"Error reading CSV file: {str(e)}")
-        st.stop()
+
+# Label selection with "All" option
+label_options = ["All"] + sorted(df["Record Label"].unique())
+selected_label = st.selectbox(
+    "🎙️ Choose Record Label",
+    label_options,
+    index=0
+)
+
+rpm = st.number_input(
+    "💸 RPM (Revenue per Million Views)", 
+    min_value=500, 
+    value=125000,
+    help="Revenue per 1 million views in INR"
+)
+
+# Filter videos for selected label or all
+if selected_label == "All":
+    label_videos = df.copy()
+else:
+    label_videos = df[df["Record Label"] == selected_label].copy()
+
+label_videos = label_videos.dropna(subset=["view_count"])
+label_videos["Estimated Revenue INR"] = label_videos["view_count"] / 1_000_000 * rpm
+est_total = label_videos["Estimated Revenue INR"].sum()
+
+# Process temporal data
+if "published_at" in label_videos:
+    label_videos["published_at"] = pd.to_datetime(label_videos["published_at"], errors="coerce")
+    label_videos["Month"] = label_videos["published_at"].dt.to_period("M").astype(str)
+    monthly_revenue = label_videos.groupby("Month")["Estimated Revenue INR"].sum().reset_index()
+else:
+    monthly_revenue = pd.DataFrame()
     
-    # Label selection with "All" option
-    if not st.session_state.youtube_data.empty:
-        label_options = ["All"] + sorted(st.session_state.youtube_data["Record Label"].unique())
-        selected_label = st.selectbox(
-            "🎙️ Choose Record Label",
-            label_options,
-            index=0
-        )
+label_videos["RPV_Estimated"] = label_videos["Estimated Revenue INR"] / label_videos["view_count"]
+top_rpv = label_videos.nlargest(10, "RPV_Estimated")[
+    ["title", "view_count", "like_count", "comment_count", "Estimated Revenue INR", "RPV_Estimated"]
+]
+
+# Display metrics
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("Estimated Revenue", f"₹{est_total:,.0f}")
+with col2:
+    st.metric("Actual Revenue", f"₹{actual_total:,.0f}")
+with col3:
+    st.metric("Accuracy", f"{(est_total / actual_total):.2%}" if actual_total else "N/A")
+
+# Enhanced filtering options
+with st.expander("🔍 Advanced Filters", expanded=False):
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Artist filtering
+        artist_options = sorted({a.strip() for aa in label_videos["Artists"].dropna() 
+                              for a in aa.split(",") if a.strip()})
+        selected_artists = st.multiselect("🎤 Filter by Artist(s)", artist_options)
         
-        rpm = st.number_input(
-            "💸 RPM (Revenue per Million Views)", 
-            min_value=500, 
-            value=125000,
-            help="Revenue per 1 million views in INR"
-        )
-
-        # Filter videos for selected label or all
-        if selected_label == "All":
-            label_videos = st.session_state.youtube_data.copy()
-        else:
-            label_videos = st.session_state.youtube_data[
-                st.session_state.youtube_data["Record Label"] == selected_label
-            ].copy()
+        # Language filtering
+        lang_options = sorted(label_videos["Language"].dropna().unique())
+        selected_langs = st.multiselect("🌐 Filter by Language(s)", lang_options)
         
-        label_videos = label_videos.dropna(subset=["view_count"])
-        label_videos["Estimated Revenue INR"] = label_videos["view_count"] / 1_000_000 * rpm
-        est_total = label_videos["Estimated Revenue INR"].sum()
-
-        # Get actual revenue from uploaded CSV
-        if "Store Name" in df.columns:
-            yt_row = df[df["Store Name"].str.lower().str.contains("youtube", na=False)]
-            actual_total = yt_row["Annual Revenue in INR"].values[0] if not yt_row.empty else 0
-        else:
-            actual_total = 0
-
-        # Process temporal data
+    with col2:
+        # Date range filtering
         if "published_at" in label_videos:
-            label_videos["published_at"] = pd.to_datetime(label_videos["published_at"], errors="coerce")
-            label_videos["Month"] = label_videos["published_at"].dt.to_period("M").astype(str)
-            monthly_revenue = label_videos.groupby("Month")["Estimated Revenue INR"].sum().reset_index()
-        else:
-            monthly_revenue = pd.DataFrame()
-            
-        label_videos["RPV_Estimated"] = label_videos["Estimated Revenue INR"] / label_videos["view_count"]
-        top_rpv = label_videos.nlargest(10, "RPV_Estimated")[
-            ["title", "view_count", "like_count", "comment_count", "Estimated Revenue INR", "RPV_Estimated"]
-        ]
-
-        # Display metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Estimated Revenue", f"₹{est_total:,.0f}")
-        with col2:
-            st.metric("Actual Revenue", f"₹{actual_total:,.0f}")
-        with col3:
-            st.metric("Accuracy", f"{(est_total / actual_total):.2%}" if actual_total else "N/A")
-
-        # Enhanced filtering options
-        with st.expander("🔍 Advanced Filters", expanded=False):
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Artist filtering
-                artist_options = sorted({a.strip() for aa in label_videos["Artists"].dropna() 
-                                      for a in aa.split(",") if a.strip()})
-                selected_artists = st.multiselect("🎤 Filter by Artist(s)", artist_options)
-                
-                # Language filtering
-                lang_options = sorted(label_videos["Language"].dropna().unique())
-                selected_langs = st.multiselect("🌐 Filter by Language(s)", lang_options)
-                
-            with col2:
-                # Date range filtering
-                if "published_at" in label_videos:
-                    valid_dates = label_videos["published_at"].dropna()
-                    if not valid_dates.empty:
-                        min_date = valid_dates.min().date()
-                        max_date = valid_dates.max().date()
-                        date_range = st.date_input(
-                            "📅 Filter by Date Range",
-                            [min_date, max_date],
-                            min_value=min_date,
-                            max_value=max_date
-                        )
-                        
-                        if len(date_range) == 2:
-                            label_videos = label_videos[
-                                (label_videos["published_at"].dt.date >= date_range[0]) & 
-                                (label_videos["published_at"].dt.date <= date_range[1])
-                            ]
-                
-                # View count filtering
-                if not label_videos.empty:
-                    min_views = int(label_videos["view_count"].min())
-                    max_views = int(label_videos["view_count"].max())
-                    view_range = st.slider(
-                        "👀 Filter by View Count",
-                        min_value=min_views,
-                        max_value=max_views,
-                        value=(min_views, max_views)
-                    )
-                    label_videos = label_videos[
-                        (label_videos["view_count"] >= view_range[0]) & 
-                        (label_videos["view_count"] <= view_range[1])
-                    ]
-
-            # Apply other filters
-            if selected_artists:
-                regex = "|".join([re.escape(a) for a in selected_artists])
-                label_videos = label_videos[label_videos["Artists"].str.contains(regex, case=False, na=False)]
-                
-            if selected_langs:
-                label_videos = label_videos[label_videos["Language"].isin(selected_langs)]
-
-        # --- Sticky Chat Input Section ---
-        st.subheader("Ask a Business Intelligence Question")
-
-        # Suggested questions as selectbox above chat input
-        suggested_questions = [
-            "What is the average view count per video?",
-            "Which video has the highest engagement rate?",
-            "How does revenue vary by language?",
-            "What is the monthly revenue trend?",
-            "Which artists generate the most revenue?"
-        ]
-        selected_suggestion = st.selectbox(
-            "💡 Or select a suggested question:",
-            [""] + suggested_questions
-        )
-
-        # Sticky chat input at the bottom
-        user_query = st.chat_input(
-            "Type your business intelligence question here...",
-            key="chat_query"
-        )
-
-        # If a suggestion is selected, show it as info if chat input is empty
-        if selected_suggestion and not user_query:
-            st.info(f"Suggested: {selected_suggestion}")
-
-        # Show chat history (user question and answer) like ChatGPT
-        if st.session_state.conversation_history:
-            st.markdown("### 💬 Chat History")
-            for entry in st.session_state.conversation_history:
-                with st.chat_message("user"):
-                    st.markdown(entry["query"])
-                with st.chat_message("assistant"):
-                    st.markdown(entry["response"])
-
-        # Quick action buttons
-        if st.session_state.conversation_history:
-            st.write("**Quick Actions:**")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                if st.button("📈 Deep dive into this"):
-                    user_query = "Can you provide a deeper analysis of the previous insight?"
-            with col2:
-                if st.button("🔍 What's next?"):
-                    user_query = "Based on the previous analysis, what should be the next steps?"
-            with col3:
-                if st.button("📊 Compare trends"):
-                    user_query = "How do these findings compare to industry benchmarks?"
-
-        if user_query:
-            with st.spinner("Analyzing with Hungama BI..."):
-                full_prompt = generate_cxo_forecasting_prompt(
-                    user_query, label_videos, monthly_revenue, est_total, actual_total, rpm
+            valid_dates = label_videos["published_at"].dropna()
+            if not valid_dates.empty:
+                min_date = valid_dates.min().date()
+                max_date = valid_dates.max().date()
+                date_range = st.date_input(
+                    "📅 Filter by Date Range",
+                    [min_date, max_date],
+                    min_value=min_date,
+                    max_value=max_date
                 )
                 
-                if st.session_state.get("debug_mode", False):
-                    with st.expander("🔧 Debug: View Full Prompt"):
-                        st.code(full_prompt)
-                
-                response, error = get_deepseek_analysis(full_prompt, API_KEY)
-
-                if error:
-                    st.error(f"Analysis Error: {error}")
-                else:
-                    # Show the latest user question and answer in chat format
-                    with st.chat_message("user"):
-                        st.markdown(user_query)
-                    with st.chat_message("assistant"):
-                        st.markdown(response)
-                    
-                    charts_generated = render_visuals_from_keywords(
-                        response, label_videos, monthly_revenue, top_rpv
-                    )
-                    
-                    insights = extract_insights_from_response(response)
-                    update_analysis_context(insights)
-                    add_to_conversation_history(user_query, response, insights, charts_generated)
-                    
-                    if len(st.session_state.conversation_history) > 1:
-                        with st.expander("🔗 Context Connection"):
-                            st.write("This analysis builds upon previous insights:")
-                            for insight in insights:
-                                st.write(f"- {insight['category'].title()}: {insight['text']}")
-
-        # Data exploration section
-        with st.expander("📋 Explore Video Data", expanded=False):
-            show_cols = [
-                "video_id", "title", "Record Label", "Artists", "Language", "Year",
-                "Month", "Date", "Time", "Day Name", "view_count", "like_count", "comment_count",
-                "duration", "published_at", "Estimated Revenue INR", "RPV_Estimated"
+                if len(date_range) == 2:
+                    label_videos = label_videos[
+                        (label_videos["published_at"].dt.date >= date_range[0]) & 
+                        (label_videos["published_at"].dt.date <= date_range[1])
+                    ]
+        
+        # View count filtering
+        if not label_videos.empty:
+            min_views = int(label_videos["view_count"].min())
+            max_views = int(label_videos["view_count"].max())
+            view_range = st.slider(
+                "👀 Filter by View Count",
+                min_value=min_views,
+                max_value=max_views,
+                value=(min_views, max_views)
+            )
+            label_videos = label_videos[
+                (label_videos["view_count"] >= view_range[0]) & 
+                (label_videos["view_count"] <= view_range[1])
             ]
-            show_cols = [col for col in show_cols if col in label_videos.columns]
+
+    # Apply other filters
+    if selected_artists:
+        regex = "|".join([re.escape(a) for a in selected_artists])
+        label_videos = label_videos[label_videos["Artists"].str.contains(regex, case=False, na=False)]
+        
+    if selected_langs:
+        label_videos = label_videos[label_videos["Language"].isin(selected_langs)]
+
+# === Charts ===
+st.subheader("📈 Monthly Revenue Trend")
+if not monthly_revenue.empty:
+    fig_line = px.line(monthly_revenue, x="Month", y="Estimated Revenue INR", title="Monthly Estimated Revenue", markers=True)
+    st.plotly_chart(fig_line, use_container_width=True)
+
+top10 = label_videos.sort_values("Estimated Revenue INR", ascending=False).head(10)
+if not top10.empty:
+    fig_bar = px.bar(top10, x="title", y="Estimated Revenue INR", title="Top 10 Revenue-Generating Videos")
+    fig_bar.update_xaxes(tickangle=45)
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+# --- Sticky Chat Input Section ---
+st.subheader("Ask a Business Intelligence Question")
+
+# Suggested questions as selectbox above chat input
+suggested_questions = [
+    "What is the average view count per video?",
+    "Which video has the highest engagement rate?",
+    "How does revenue vary by language?",
+    "What is the monthly revenue trend?",
+    "Which artists generate the most revenue?",
+    "Which label generates the highest revenue per month?",
+    "How many videos would it take to recover an ₹8 Cr investment?",
+    "What's the ROI if we invest ₹5 Cr into our top channel?",
+]
+selected_suggestion = st.selectbox(
+    "💡 Or select a suggested question:",
+    [""] + suggested_questions
+)
+
+# Sticky chat input at the bottom
+user_query = st.chat_input(
+    "Type your business intelligence question here...",
+    key="chat_query"
+)
+
+# If a suggestion is selected, show it as info if chat input is empty
+if selected_suggestion and not user_query:
+    st.info(f"Suggested: {selected_suggestion}")
+
+# Show chat history (user question and answer) like ChatGPT
+if st.session_state.conversation_history:
+    st.markdown("### 💬 Chat History")
+    for entry in st.session_state.conversation_history:
+        with st.chat_message("user"):
+            st.markdown(entry["query"])
+        with st.chat_message("assistant"):
+            st.markdown(entry["response"])
+
+# Quick action buttons
+if st.session_state.conversation_history:
+    st.write("**Quick Actions:**")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("📈 Deep dive into this"):
+            user_query = "Can you provide a deeper analysis of the previous insight?"
+    with col2:
+        if st.button("🔍 What's next?"):
+            user_query = "Based on the previous analysis, what should be the next steps?"
+    with col3:
+        if st.button("📊 Compare trends"):
+            user_query = "How do these findings compare to industry benchmarks?"
+
+if user_query:
+    with st.spinner("Analyzing with Hungama BI..."):
+        full_prompt = generate_cxo_forecasting_prompt(
+            user_query, label_videos, monthly_revenue, est_total, actual_total, rpm
+        )
+        
+        if st.session_state.get("debug_mode", False):
+            with st.expander("🔧 Debug: View Full Prompt"):
+                st.code(full_prompt)
+        
+        response, error = get_deepseek_analysis(full_prompt, API_KEY)
+
+        if error:
+            st.error(f"Analysis Error: {error}")
+        else:
+            # Show the latest user question and answer in chat format
+            with st.chat_message("user"):
+                st.markdown(user_query)
+            with st.chat_message("assistant"):
+                st.markdown(response)
             
-            st.dataframe(
-                label_videos[show_cols].sort_values("view_count", ascending=False),
-                use_container_width=True,
-                height=400
+            charts_generated = render_visuals_from_keywords(
+                response, label_videos, monthly_revenue, top_rpv
             )
             
-            st.download_button(
-                "📥 Export Video Data", 
-                label_videos.to_csv(index=False), 
-                f"{selected_label}_videos.csv"
-            )
+            insights = extract_insights_from_response(response)
+            update_analysis_context(insights)
+            add_to_conversation_history(user_query, response, insights, charts_generated)
+            
+            if len(st.session_state.conversation_history) > 1:
+                with st.expander("🔗 Context Connection"):
+                    st.write("This analysis builds upon previous insights:")
+                    for insight in insights:
+                        st.write(f"- {insight['category'].title()}: {insight['text']}")
 
-        # Conversation history export
-        if st.session_state.conversation_history:
-            conversation_export = pd.DataFrame(st.session_state.conversation_history)
-            st.download_button(
-                "📥 Export Conversation History",
-                conversation_export.to_csv(index=False),
-                f"conversation_history_{st.session_state.session_id}.csv"
-            )
-
-    else:
-        st.warning("No YouTube data available. Please check your JSON file.")
-
-else:
-    st.info("📁 Upload a revenue CSV to get started.")
-    st.markdown("""
-    ### 🧠 Key Features:
-    - **Comprehensive Analytics**: View counts, engagement metrics, revenue estimation
-    - **Context-Aware AI**: Remembers previous questions and builds on them
-    - **Advanced Filtering**: Filter by artists, languages, date ranges
-    - **Visualizations**: Automatic generation of relevant charts
-    - **Data Export**: Download filtered data and conversation history
+# Data exploration section
+with st.expander("📋 Explore Video Data", expanded=False):
+    show_cols = [
+        "video_id", "title", "Record Label", "Artists", "Language", "Year",
+        "Month", "Date", "Time", "Day Name", "view_count", "like_count", "comment_count",
+        "duration", "published_at", "Estimated Revenue INR", "RPV_Estimated"
+    ]
+    show_cols = [col for col in show_cols if col in label_videos.columns]
     
-    ### 📊 Sample Questions to Try:
-    - "What is our top performing video by revenue per view?"
-    - "How does engagement vary by language?"
-    - "Show me the monthly revenue trend for the past year"
-    - "Which artists generate the most views?"
-    """)
+    st.dataframe(
+        label_videos[show_cols].sort_values("view_count", ascending=False),
+        use_container_width=True,
+        height=400
+    )
+    
+    st.download_button(
+        "📥 Export Video Data", 
+        label_videos.to_csv(index=False), 
+        f"{selected_label}_videos.csv"
+    )
+
+# Conversation history export
+if st.session_state.conversation_history:
+    conversation_export = pd.DataFrame(st.session_state.conversation_history)
+    st.download_button(
+        "📥 Export Conversation History",
+        conversation_export.to_csv(index=False),
+        f"conversation_history_{st.session_state.session_id}.csv"
+    )
 
 # Debug mode toggle (hidden)
 if st.sidebar.checkbox("🔧 Debug Mode", False, key="debug_mode"):
     st.sidebar.write("Debug options enabled")
     if st.session_state.get("youtube_data") is not None:
         st.sidebar.write(f"Data shape: {st.session_state.youtube_data.shape}")
+        st.sidebar.write(f"Database table: {selected_table}")
