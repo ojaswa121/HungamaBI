@@ -644,3 +644,5 @@ if st.sidebar.checkbox("🔧 Debug Mode", False, key="debug_mode"):
     if st.session_state.get("youtube_data") is not None:
         st.sidebar.write(f"Data shape: {st.session_state.youtube_data.shape}")
         st.sidebar.write(f"Database table: {selected_table}")
+
+
