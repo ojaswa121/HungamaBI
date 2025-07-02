@@ -25,6 +25,7 @@ plotly>=5.15.0
 openai>=1.0.0
 lida>=0.0.10
 python-dotenv>=1.0.0
+sqlalchemy
 spacy>=3.6.0
 Pillow>=10.0.0
 seaborn>=0.12.0
